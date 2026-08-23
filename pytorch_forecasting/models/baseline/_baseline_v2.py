@@ -62,6 +62,7 @@ class Baseline_v2(BaseModel):
         self.save_hyperparameters(ignore=["loss", "logging_metrics", "metadata"])
         self.metadata = metadata or {}
         self.max_prediction_length = self.metadata.get("max_prediction_length", 1)
+        self.dummy = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -91,5 +92,6 @@ class Baseline_v2(BaseModel):
 
         # Expand across prediction length
         prediction = last_target.unsqueeze(1).expand(-1, self.max_prediction_length, -1)
+        prediction = prediction + 0.0 * self.dummy
 
         return {"prediction": prediction}
