@@ -2,7 +2,7 @@
 N-Beats model for pytorch-forecasting v2 (no covariates).
 """
 
-from typing import Any, Optional, Union
+from typing import Any
 
 from torch import nn
 from torch.optim import Optimizer
