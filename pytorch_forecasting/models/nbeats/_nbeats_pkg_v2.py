@@ -11,7 +11,7 @@ class NBeats_pkg_v2(Base_pkg):
         "info:compute": 1,
         "info:y_type": ["numeric"],
         "authors": [
-            "dmitri-carpov"  # paper author
+            "dmitri-carpov",  # paper author
             "jdb78",  # for v1
             "Faakhir30",
         ],
@@ -92,7 +92,6 @@ class NBeats_pkg_v2(Base_pkg):
 
         for param in params:
             current_dm_cfg = param.get("datamodule_cfg", {})
-            default_dm_cfg.update(current_dm_cfg)
-            param["datamodule_cfg"] = default_dm_cfg.copy()
+            param["datamodule_cfg"] = {**default_dm_cfg, **current_dm_cfg}
 
         return params
