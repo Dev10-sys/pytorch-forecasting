@@ -1,6 +1,6 @@
+import json
 from pathlib import Path
-import pickle
-from typing import Any, Optional, Union
+from typing import Any
 
 from lightning import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -49,25 +49,23 @@ class Base_pkg(_BasePtForecasterV2):
     ):
         self.ckpt_path = Path(ckpt_path) if ckpt_path else None
         self.model_cfg = self._load_config(
-            model_cfg, ckpt_path=self.ckpt_path, auto_file_name="model_cfg.pkl"
+            model_cfg, ckpt_path=self.ckpt_path, auto_file_name="model_cfg.json"
         )
-        print(self.model_cfg)
 
         self.datamodule_cfg = self._load_config(
             datamodule_cfg,
             ckpt_path=self.ckpt_path,
-            auto_file_name="datamodule_cfg.pkl",
+            auto_file_name="datamodule_cfg.json",
         )
         self.trainer_cfg = self._load_config(trainer_cfg)
         self.metadata = self._load_config(
-            None, ckpt_path=self.ckpt_path, auto_file_name="metadata.pkl"
+            None, ckpt_path=self.ckpt_path, auto_file_name="metadata.json"
         )
 
         self.model = None
         self.trainer = None
         self.datamodule = None
         if self.ckpt_path:
-            print(self.metadata)
             self._build_model(metadata=self.metadata, **self.model_cfg)
         else:
             self.model = None
@@ -78,15 +76,31 @@ class Base_pkg(_BasePtForecasterV2):
         ckpt_path: str | Path | None = None,
         auto_file_name: str | None = None,
     ) -> dict:
-        """
-        Loads configuration from a dictionary, YAML file, or Pickle file.
+        """Load configuration from a dictionary, YAML file, or JSON file.
+
+        Parameters
+        ----------
+        config : dict, str, Path, or None
+            Configuration source.  If ``None`` and ``ckpt_path`` /
+            ``auto_file_name`` are provided, the sidecar file is loaded
+            automatically.
+        ckpt_path : str or Path, optional
+            Checkpoint path whose parent directory is searched for the
+            auto-named sidecar file.
+        auto_file_name : str, optional
+            Filename of the sidecar config (e.g. ``"model_cfg.json"``).
+
+        Returns
+        -------
+        dict
+            Loaded configuration dictionary.
         """
         if config is None:
             if ckpt_path and auto_file_name:
                 path = Path(ckpt_path).parent / auto_file_name
                 if path.exists():
-                    with open(path, "rb") as f:
-                        return pickle.load(f)  # noqa : S301
+                    with open(path) as f:
+                        return json.load(f)
             return {}
 
         if isinstance(config, dict):
@@ -97,19 +111,18 @@ class Base_pkg(_BasePtForecasterV2):
             raise FileNotFoundError(f"Configuration file not found: {path}")
 
         suffix = path.suffix.lower()
-        print(suffix)
 
         if suffix in [".yaml", ".yml"]:
             with open(path) as f:
                 return yaml.safe_load(f) or {}
 
-        elif suffix == ".pkl":
-            with open(path, "rb") as f:
-                return pickle.load(f)  # noqa: S301
-        else:
-            raise ValueError(
-                f"Unsupported config format: {suffix}. Use .yaml, .yml, or .pkl"
-            )
+        if suffix == ".json":
+            with open(path) as f:
+                return json.load(f)
+
+        raise ValueError(
+            f"Unsupported config format: {suffix}. Use .yaml, .yml, or .json"
+        )
 
     @classmethod
     def get_cls(cls):
@@ -179,18 +192,18 @@ class Base_pkg(_BasePtForecasterV2):
             )
 
     def _save_artifact(self, output_dir: Path):
-        """Save all configuration artifacts."""
+        """Save all configuration artifacts as JSON."""
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        with open(output_dir / "datamodule_cfg.pkl", "wb") as f:
-            pickle.dump(self.datamodule_cfg, f)
+        with open(output_dir / "datamodule_cfg.json", "w") as f:
+            json.dump(self.datamodule_cfg, f)
 
-        with open(output_dir / "model_cfg.pkl", "wb") as f:
-            pickle.dump(self.model_cfg, f)
+        with open(output_dir / "model_cfg.json", "w") as f:
+            json.dump(self.model_cfg, f)
 
         if self.datamodule is not None and hasattr(self.datamodule, "metadata"):
-            with open(output_dir / "metadata.pkl", "wb") as f:
-                pickle.dump(self.datamodule.metadata, f)
+            with open(output_dir / "metadata.json", "w") as f:
+                json.dump(self.datamodule.metadata, f)
 
     def fit(
         self,
@@ -304,10 +317,8 @@ class Base_pkg(_BasePtForecasterV2):
         if output_dir:
             output_path = Path(output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
-            output_file = output_path / "predictions.pkl"
-            with open(output_file, "wb") as f:
-                pickle.dump(predictions, f)
-            print(f"Predictions saved to {output_file}")
+            output_file = output_path / "predictions.pt"
+            torch.save(predictions, output_file)
             return None
 
         return predictions
