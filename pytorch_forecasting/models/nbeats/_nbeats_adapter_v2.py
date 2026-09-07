@@ -1,6 +1,6 @@
 """Shared N-Beats adapter for pytorch-forecasting v2."""
 
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from torch import nn
@@ -15,7 +15,36 @@ from pytorch_forecasting.models.base._tslib_base_model_v2 import TslibBaseModel
 
 
 class NBeatsAdapterV2(TslibBaseModel):
-    """Shared forward / training helpers for NBeats and NBeatsKAN (v2)."""
+    """Shared forward and training logic for NBeats and NBeatsKAN (v2).
+
+    This adapter bridges the v2 tslib batch format to the N-BEATS block
+    computations originally implemented in the v1 ``NBeatsAdapter``.
+    Subclasses are expected to build ``self.net_blocks`` (an
+    ``nn.ModuleList``) during ``__init__``.
+
+    Parameters
+    ----------
+    loss : Metric
+        Loss function used for training.
+    logging_metrics : list of nn.Module, optional
+        Additional metrics logged during training/validation/test.
+    optimizer : Optimizer or str, default="adam"
+        Optimizer or name of a registered optimizer.
+    optimizer_params : dict, optional
+        Keyword arguments forwarded to the optimizer constructor.
+    lr_scheduler : str, optional
+        Name of a registered learning-rate scheduler.
+    lr_scheduler_params : dict, optional
+        Keyword arguments forwarded to the scheduler constructor.
+    metadata : dict, optional
+        DataModule metadata dict; used to extract ``context_length`` and
+        ``prediction_length``.
+    backcast_loss_ratio : float, default=0.0
+        Weight of the backcast reconstruction loss relative to the
+        forecast loss.  Set to 0 to disable.
+    **kwargs : Any
+        Additional keyword arguments forwarded to ``TslibBaseModel``.
+    """
 
     def __init__(
         self,
@@ -41,10 +70,17 @@ class NBeatsAdapterV2(TslibBaseModel):
         self.backcast_loss_ratio = backcast_loss_ratio
 
     def _target_from_batch(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Extract univariate target history.
+        """Extract univariate target history from a v2 tslib batch.
 
-        v1 used ``x["encoder_cont"][..., 0]``. v2 tslib batches keep the target
-        in ``history_target``.
+        Parameters
+        ----------
+        x : dict of str to torch.Tensor
+            Batch dictionary produced by ``TslibDataModule``.
+
+        Returns
+        -------
+        torch.Tensor
+            Target history tensor of shape ``(batch, context_length)``.
         """
         target = x["history_target"]
         if target.ndim == 3:
@@ -52,15 +88,21 @@ class NBeatsAdapterV2(TslibBaseModel):
         return target
 
     def forward(self, x: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Pass forward of network.
+        """Run the N-BEATS forward pass.
 
-        Network steps match v1 ``NBeatsAdapter.forward``; only input assembly
-        and output packaging differ for the v2 API.
+        Parameters
+        ----------
+        x : dict of str to torch.Tensor
+            Batch dictionary produced by ``TslibDataModule``.
+
+        Returns
+        -------
+        dict of str to torch.Tensor
+            Dictionary with keys ``"prediction"``, ``"backcast"``,
+            ``"trend"``, ``"seasonality"``, and ``"generic"``.
         """
-        # --- v2 batch adapter (v1: target = x["encoder_cont"][..., 0]) ---
         target = self._target_from_batch(x)
 
-        # --- same as v1 from here ---
         timesteps = self.context_length + self.prediction_length
         generic_forecast = [
             torch.zeros(
@@ -83,12 +125,10 @@ class NBeatsAdapterV2(TslibBaseModel):
             device=self.device,
         )
 
-        backcast = target  # initialize backcast
-        for i, block in enumerate(self.net_blocks):
-            # evaluate block
+        backcast = target
+        for block in self.net_blocks:
             backcast_block, forecast_block = block(backcast)
 
-            # add for interpretation
             full = torch.cat([backcast_block.detach(), forecast_block.detach()], dim=1)
             if isinstance(block, NBEATSTrendBlock):
                 trend_forecast.append(full)
@@ -97,10 +137,8 @@ class NBeatsAdapterV2(TslibBaseModel):
             else:
                 generic_forecast.append(full)
 
-            # update backcast and forecast
-            backcast = (
-                backcast - backcast_block
-            )  # do not use backcast -= backcast_block as this signifies an inline operation  # noqa: E501
+            # Avoid in-place op so autograd graph is not corrupted.
+            backcast = backcast - backcast_block
             forecast = forecast + forecast_block
 
         prediction = forecast.unsqueeze(-1)
@@ -109,7 +147,6 @@ class NBeatsAdapterV2(TslibBaseModel):
         seasonality = torch.stack(seasonal_forecast, dim=0).sum(0).unsqueeze(-1)
         generic = torch.stack(generic_forecast, dim=0).sum(0).unsqueeze(-1)
 
-        # v1 applied transform_output via BaseModel; v2 tslib does so when scales exist
         if "target_scale" in x:
             prediction = self.transform_output(prediction, x["target_scale"])
             backcast_out = self.transform_output(backcast_out, x["target_scale"])
@@ -117,7 +154,6 @@ class NBeatsAdapterV2(TslibBaseModel):
             seasonality = self.transform_output(seasonality, x["target_scale"])
             generic = self.transform_output(generic, x["target_scale"])
 
-        # v1: to_network_output(...); v2: plain dict
         return {
             "prediction": prediction,
             "backcast": backcast_out,
@@ -132,10 +168,22 @@ class NBeatsAdapterV2(TslibBaseModel):
         y: torch.Tensor,
         out: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forecast loss plus optional backcast term (v1 ``step`` parity).
+        """Compute forecast loss with optional backcast regularisation.
 
-        Applied for train / val / test (not predict), matching v1's
-        ``not self.predicting`` guard on the shared ``step()``.
+        Parameters
+        ----------
+        x : dict of str to torch.Tensor
+            Input batch dictionary.
+        y : torch.Tensor
+            Ground-truth forecast target.
+        out : dict of str to torch.Tensor
+            Output of :meth:`forward`.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``(loss, y_hat)`` where ``loss`` is the scalar training loss and
+            ``y_hat`` is the raw prediction tensor.
         """
         y_hat = out["prediction"]
         loss = self.loss(y_hat, y)
@@ -160,20 +208,19 @@ class NBeatsAdapterV2(TslibBaseModel):
     def training_step(
         self, batch: tuple[dict[str, torch.Tensor]], batch_idx: int
     ) -> dict[str, torch.Tensor]:
-        """
-        Training step for the model with optional backcast loss.
+        """Run one training step.
 
         Parameters
         ----------
-        batch : Tuple[Dict[str, torch.Tensor]]
-            Batch of data containing input and target tensors.
+        batch : tuple of dict of str to torch.Tensor
+            Batch produced by the DataLoader.
         batch_idx : int
-            Index of the batch.
+            Index of the current batch.
 
         Returns
         -------
-        STEP_OUTPUT
-            Dictionary containing the loss and other metrics.
+        dict of str to torch.Tensor
+            Dictionary with key ``"loss"``.
         """
         x, y = batch
         out = self(x)
@@ -187,20 +234,19 @@ class NBeatsAdapterV2(TslibBaseModel):
     def validation_step(
         self, batch: tuple[dict[str, torch.Tensor]], batch_idx: int
     ) -> dict[str, torch.Tensor]:
-        """
-        Validation step for the model with optional backcast loss.
+        """Run one validation step.
 
         Parameters
         ----------
-        batch : Tuple[Dict[str, torch.Tensor]]
-            Batch of data containing input and target tensors.
+        batch : tuple of dict of str to torch.Tensor
+            Batch produced by the DataLoader.
         batch_idx : int
-            Index of the batch.
+            Index of the current batch.
 
         Returns
         -------
-        STEP_OUTPUT
-            Dictionary containing the loss and other metrics.
+        dict of str to torch.Tensor
+            Dictionary with key ``"val_loss"``.
         """
         x, y = batch
         out = self(x)
@@ -214,20 +260,19 @@ class NBeatsAdapterV2(TslibBaseModel):
     def test_step(
         self, batch: tuple[dict[str, torch.Tensor]], batch_idx: int
     ) -> dict[str, torch.Tensor]:
-        """
-        Test step for the model with optional backcast loss.
+        """Run one test step.
 
         Parameters
         ----------
-        batch : Tuple[Dict[str, torch.Tensor]]
-            Batch of data containing input and target tensors.
+        batch : tuple of dict of str to torch.Tensor
+            Batch produced by the DataLoader.
         batch_idx : int
-            Index of the batch.
+            Index of the current batch.
 
         Returns
         -------
-        STEP_OUTPUT
-            Dictionary containing the loss and other metrics.
+        dict of str to torch.Tensor
+            Dictionary with key ``"test_loss"``.
         """
         x, y = batch
         out = self(x)
