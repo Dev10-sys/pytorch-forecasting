@@ -1,6 +1,6 @@
 """Shared N-Beats adapter for pytorch-forecasting v2."""
 
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from torch import nn
@@ -15,7 +15,30 @@ from pytorch_forecasting.models.base._tslib_base_model_v2 import TslibBaseModel
 
 
 class NBeatsAdapterV2(TslibBaseModel):
-    """Shared forward / training helpers for NBeats and NBeatsKAN (v2)."""
+    """
+    Shared forward / training helpers for NBeats, NBeatsKAN, and NBEATSx (v2).
+
+    Parameters
+    ----------
+    loss : Metric
+        Loss function for training.
+    logging_metrics : list[nn.Module] | None, optional
+        List of metrics to log during training, by default None.
+    optimizer : Optimizer | str | None, optional
+        Optimizer to use, by default "adam".
+    optimizer_params : dict | None, optional
+        Parameters for the optimizer, by default None.
+    lr_scheduler : str | None, optional
+        Learning rate scheduler, by default None.
+    lr_scheduler_params : dict | None, optional
+        Parameters for the learning rate scheduler, by default None.
+    metadata : dict | None, optional
+        Metadata dictionary, by default None.
+    backcast_loss_ratio : float, optional
+        Ratio of backcast loss to add to forecast loss, by default 0.0.
+    **kwargs : Any
+        Additional keyword arguments.
+    """
 
     def __init__(
         self,
@@ -57,10 +80,8 @@ class NBeatsAdapterV2(TslibBaseModel):
         Network steps match v1 ``NBeatsAdapter.forward``; only input assembly
         and output packaging differ for the v2 API.
         """
-        # --- v2 batch adapter (v1: target = x["encoder_cont"][..., 0]) ---
         target = self._target_from_batch(x)
 
-        # --- same as v1 from here ---
         timesteps = self.context_length + self.prediction_length
         generic_forecast = [
             torch.zeros(
@@ -84,7 +105,7 @@ class NBeatsAdapterV2(TslibBaseModel):
         )
 
         backcast = target  # initialize backcast
-        for i, block in enumerate(self.net_blocks):
+        for block in self.net_blocks:
             # evaluate block
             backcast_block, forecast_block = block(backcast)
 
@@ -98,9 +119,7 @@ class NBeatsAdapterV2(TslibBaseModel):
                 generic_forecast.append(full)
 
             # update backcast and forecast
-            backcast = (
-                backcast - backcast_block
-            )  # do not use backcast -= backcast_block as this signifies an inline operation  # noqa: E501
+            backcast = backcast - backcast_block
             forecast = forecast + forecast_block
 
         prediction = forecast.unsqueeze(-1)
@@ -109,7 +128,6 @@ class NBeatsAdapterV2(TslibBaseModel):
         seasonality = torch.stack(seasonal_forecast, dim=0).sum(0).unsqueeze(-1)
         generic = torch.stack(generic_forecast, dim=0).sum(0).unsqueeze(-1)
 
-        # v1 applied transform_output via BaseModel; v2 tslib does so when scales exist
         if "target_scale" in x:
             prediction = self.transform_output(prediction, x["target_scale"])
             backcast_out = self.transform_output(backcast_out, x["target_scale"])
@@ -117,7 +135,6 @@ class NBeatsAdapterV2(TslibBaseModel):
             seasonality = self.transform_output(seasonality, x["target_scale"])
             generic = self.transform_output(generic, x["target_scale"])
 
-        # v1: to_network_output(...); v2: plain dict
         return {
             "prediction": prediction,
             "backcast": backcast_out,
